@@ -1,0 +1,43 @@
+name: Update shipment progress
+
+on:
+  schedule:
+    # Weekdays at 14:00 UTC. GitHub Actions cron is fixed UTC and does not
+    # adjust for daylight saving time (unlike the Allen County repo's 7am ET
+    # schedule, this one is left in plain UTC rather than chasing a US
+    # timezone — adjust freely).
+    - cron: "0 14 * * 1-5"
+  workflow_dispatch: {}
+
+# Required: the default GITHUB_TOKEN is read-only unless you grant this
+# explicitly, either here or in the repo's Settings > Actions > General >
+# "Workflow permissions". The block below is enough on its own — no repo
+# setting change needed — but it's worth checking that repo setting hasn't
+# been set to something that blocks it entirely.
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run update script
+        run: python3 update_site.py
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          if git diff --cached --quiet; then
+            echo "No changes to publish."
+          else
+            git commit -m "Automated shipment progress update"
+            git push
+          fi
