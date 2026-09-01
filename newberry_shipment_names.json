@@ -1,0 +1,10 @@
+{
+  "_comment": "Friendly, partner-readable names for shipment tracking codes. Keys starting with _ are ignored by the scripts. Derived from the actual item titles in each shipment -- all are Edward E. Ayer Collection material, predominantly Indigenous-language texts, grammars, catechisms and Americana. Correct anything that does not match Newberry's own shelf/box naming. AYER12BX's box number was inferred from the code, not confirmed.",
+  "AYERBX21": "Ayer Collection, Box 21 - Indigenous language materials",
+  "AYERBX22": "Ayer Collection, Box 22 - Indigenous language materials",
+  "AYERBX23": "Ayer Collection, Box 23 - Indigenous language materials",
+  "AYERBX24": "Ayer Collection, Box 24 - Indigenous language materials",
+  "AYERBX25": "Ayer Collection, Box 25 - Indigenous language materials",
+  "AYERBX26": "Ayer Collection, Box 26 - Indigenous language materials",
+  "AYER12BX": "Ayer Collection - Indigenous language materials"
+}
