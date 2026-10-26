@@ -21,5 +21,21 @@
   },
   "AYERBX26": {
     "name": "Ayer Collection, Box 26 - Indigenous language materials"
+  },
+  "AYERBX18": {
+    "name": "Ayer Collection, Box 18 - Dakota-language Bibles and texts",
+    "notes": "Name derived from item titles; box number inferred from the code."
+  },
+  "AYERBX19": {
+    "name": "Ayer Collection, Box 19 - Gospels in Indigenous languages",
+    "notes": "Name derived from item titles; box number inferred from the code."
+  },
+  "AYER14BX": {
+    "name": "Ayer Collection, Box 14 - Indigenous language materials",
+    "notes": "Name derived from item titles; box number inferred from the code."
+  },
+  "AYERBX30": {
+    "name": "Ayer Collection, Box 30 - Indigenous language materials",
+    "notes": "Name derived from item titles; box number inferred from the code."
   }
 }
