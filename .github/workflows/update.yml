@@ -3,19 +3,21 @@ name: Update shipment progress
 on:
   schedule:
     # Weekdays at 14:00 UTC. GitHub Actions cron is fixed UTC and does not
-    # adjust for daylight saving time (unlike the Allen County repo's 7am ET
-    # schedule, this one is left in plain UTC rather than chasing a US
-    # timezone — adjust freely).
+    # adjust for daylight saving time. Adjust freely: https://crontab.guru
     - cron: "0 14 * * 1-5"
   workflow_dispatch: {}
 
 # Required: the default GITHUB_TOKEN is read-only unless you grant this
 # explicitly, either here or in the repo's Settings > Actions > General >
-# "Workflow permissions". The block below is enough on its own — no repo
-# setting change needed — but it's worth checking that repo setting hasn't
-# been set to something that blocks it entirely.
+# "Workflow permissions". The block below is enough on its own.
 permissions:
   contents: write
+
+# Prevents a manual workflow_dispatch run from racing the scheduled run -- both
+# push to main, and the loser's push fails, dropping that day's snapshot.
+concurrency:
+  group: update-site-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -27,6 +29,8 @@ jobs:
         with:
           python-version: "3.x"
 
+      # update_site.py imports shipment_core.py -- both must be committed to
+      # this repo, next to index.html.
       - name: Run update script
         run: python3 update_site.py
 
@@ -34,7 +38,16 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add index.html
+          # Must list every path update_site.py WRITES, not just the page --
+          # these three names must match SITE_PATH / ENUM_CACHE_PATH /
+          # COMPLETED_HISTORY_PATH in that script's CONFIG block exactly (they
+          # get renamed per partner). A forgotten path here doesn't error -- it
+          # just silently resets that file on every scheduled run, since the
+          # Action's checkout is fresh each time and anything not committed
+          # here never persists. The manifest (<partner>_shipments.json) is
+          # deliberately NOT listed: it is human-edited input that the script
+          # only ever reads.
+          git add index.html newberry_enum_cache.json newberry_completed_history.json
           if git diff --cached --quiet; then
             echo "No changes to publish."
           else

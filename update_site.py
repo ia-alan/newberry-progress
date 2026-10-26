@@ -1,663 +1,395 @@
 #!/usr/bin/env python3
 """
-Refresh index.html (the live partner-facing site) with current shipment
-progress from archive.org. This is the version that runs in CI (GitHub
-Actions) — it has no dependency on any local files, only what's checked
-into this repo (this script, index.html, stub_seeds.json).
+Refresh index.html (the partner-facing page) with current shipment progress
+from archive.org. This is the script the scheduled GitHub Action runs, and
+you can run it by hand too:
 
-Run manually with:
+    python3 update_site.py                 # normal run
+    python3 update_site.py --full-scan     # audit: pull the whole collection, re-check empty slots
+    python3 update_site.py --recheck-absent
+    python3 update_site.py --force         # publish a result the safety checks refused (read why first)
 
-    python3 update_site.py
+It needs shipment_core.py (the shared engine -- fetching, hidden-item
+recovery, the manifest, caching, retries) in the same folder, plus
+index.html, the manifest, and the two cache/history JSON files. Everything it
+needs is in the site repo; nothing depends on a local machine.
 
-Normally run automatically by .github/workflows/update.yml on a schedule.
+Which shipments appear
+----------------------
+A shipment is "active" if it had a completion or a newly added item in the
+last ACTIVE_WINDOW_DAYS and is not yet complete -- or it is declared in the
+manifest and not closed (so a shipment that has been received but has nothing
+scanned yet does not just vanish). A shipment that reaches completed == total
+is recorded in COMPLETED_HISTORY_PATH and drops out of Active; the page shows
+only the COMPLETED_DISPLAY_COUNT most recent completions. The run in which a
+shipment's last item finishes still shows it in Active once more, flagged
+"finalizing".
 
-It pulls every SEARCHABLE archive.org item in the target collection, groups
-by the grouping field (e.g. shiptracking), and additionally recovers "stub"
-items that archive.org excludes from search entirely (metadata field
-noindex:true — commonly used for items that are received/reserved but not
-yet fully processed). Those stubs are invisible to any search query, so this
-script finds them a different way: for group codes whose searchable
-identifiers follow a detectable "prefix + sequential number" pattern (e.g.
-smithfam04, smithfam05, ...), it directly probes archive.org/metadata/<id>
-for the full number range (including gaps and a run past the highest known
-number) to recover the true total. Group codes with no searchable items at
-all (a brand new shipment that hasn't had anything indexed yet) can only be
-found this way if you seed one known identifier for them in
-stub_seeds.json — see that file for the format.
+A completed record is refreshed on every run while the shipment is still
+inside the activity window, and a shipment recorded as complete that turns out
+to be bigger (more items arrive) is reopened -- the first snapshot is not
+frozen in forever.
 
-A shipment counts as "active" if it has had a completion or a newly-added
-stub item within ACTIVE_WINDOW_DAYS.
+Is a total trustworthy?
+-----------------------
+Search only shows FINISHED items, so a shipment whose total is only "what
+search shows" reads 100% at every step of scanning. Each shipment therefore
+carries total_confirmed: true when the total comes from enumeration or a
+packing-list count in the manifest, false when it is only search-visible. An
+unconfirmed shipment is not called complete until it has been quiet for
+UNCONFIRMED_QUIET_DAYS, and the page labels it "still receiving items".
 
-Everything else in the HTML (layout, styling) is left untouched — this
-script only ever rewrites the single-line `const SHIPMENTS = {...};` and
-`const SNAPSHOT_DATE = "...";` statements.
+Everything in the HTML outside the single-line `const SHIPMENTS = {...};` and
+`const SNAPSHOT_DATE = "...";` statements is left untouched.
 
-See the skill's SKILL.md and README.md before adapting the CONFIG block
-below to a new partner/collection — in particular, verify the noindex/stub
-phenomenon actually exists for the new collection before assuming this whole
-pipeline is necessary; some collections may not need it at all (see
-"Step 2: check whether stub discovery is even needed" in SKILL.md).
+See the skill's SKILL.md and README.md before adapting the CONFIG block below
+to a new partner/collection.
 """
 
 import json
-import re
 import sys
-import time
-import urllib.request
-import urllib.parse
-from collections import defaultdict
 from datetime import date, datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import shipment_core as core
+from shipment_core import load_manifest
 
 # ============================== CONFIG ======================================
 # Adjust these for a new partner/collection. Everything below this block is
 # domain-generic and should not need to change.
 
-SITE_PATH = "index.html"          # the HTML file this script rewrites
-SEEDS_PATH = "newberry_stub_seeds.json"  # not expected to be needed here — see README.md
-NAMES_PATH = "newberry_shipment_names.json"       # optional {CODE: "Friendly name"} map; see shipment_names.example.json
-ENUM_CACHE_PATH = "newberry_enum_cache.json"  # persists settled stub-discovery numbers across runs -- see README.md "Enumeration cache"
-
-# Guard rails for the write step (see sanity_check below).
-MAX_SHRINK_PCT = 40                  # refuse to publish if total items drop more than this vs the current file
-MAX_UNRESOLVED_PROBES = 10           # refuse to publish if more than this many identifier probes failed
+SITE_PATH = "index.html"                              # the HTML file this script rewrites
+MANIFEST_PATH = "newberry_shipments.json"
+ENUM_CACHE_PATH = "newberry_enum_cache.json"
+COMPLETED_HISTORY_PATH = "newberry_completed_history.json"
+COMPLETED_DISPLAY_COUNT = 7                           # only the N most recently completed shipments are shown
 
 COLLECTION_QUERY = "collection:newberry AND scanningcenter:indiana"
 GROUPING_FIELD = "shiptracking"
 COMPLETE_FIELD = "repub_state"
 COMPLETE_VALUE = "19"
 
-# Fields pulled from the bulk search index. Must include the identifier,
-# GROUPING_FIELD, COMPLETE_FIELD, and any date fields used for recency below.
-FIELDS = f"identifier,{GROUPING_FIELD},{COMPLETE_FIELD},republisher_date,publicdate"
-
 ACTIVE_WINDOW_DAYS = 90
+UNCONFIRMED_QUIET_DAYS = 14          # a shipment whose total is only what search shows isn't called complete until it's been this quiet
+STALE_DECLARED_DAYS = 120            # a declared shipment with zero items this long after `received` gets flagged (still shown)
+
+# Guard rails for the write step (see sanity_check below).
+MAX_SHRINK_PCT = 40                  # refuse to publish if OBSERVED items drop more than this vs the current file
+MAX_DISPLAYED_SHRINK_PCT = 70        # much looser check on the manifest-inflated displayed total -- catches a gross manifest typo without tripping on a legitimate recount
+MAX_UNRESOLVED_PROBES = 10           # refuse to publish if more than this many identifier probes failed (flat floor)
+MAX_UNRESOLVED_PROBE_RATE = 0.05     # ...or more than this fraction of all probes made this run, whichever is larger
 # =============================================================================
 
-SCRAPE_URL = "https://archive.org/services/search/v1/scrape"
-METADATA_URL = "https://archive.org/metadata/"
-
-ID_PATTERN = re.compile(r"^([a-zA-Z]+?)(\d+)$")
-
-
-# ---------- Bulk fetch of the searchable index ----------
-
-def fetch_scrape_page(params, retries=4):
-    url = SCRAPE_URL + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "partner-site-update/1.0"})
-    for attempt in range(retries):
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except Exception as e:
-            if attempt == retries - 1:
-                raise
-            print(f"  (page fetch failed: {e} — retrying, attempt {attempt + 2}/{retries})", flush=True)
-            time.sleep(2 * (attempt + 1))
+core.configure(
+    COLLECTION_QUERY=COLLECTION_QUERY, GROUPING_FIELD=GROUPING_FIELD,
+    COMPLETE_FIELD=COMPLETE_FIELD, COMPLETE_VALUE=COMPLETE_VALUE,
+    ACTIVE_WINDOW_DAYS=ACTIVE_WINDOW_DAYS, STALE_DECLARED_DAYS=STALE_DECLARED_DAYS,
+    MANIFEST_PATH=MANIFEST_PATH, ENUM_CACHE_PATH=ENUM_CACHE_PATH,
+    USER_AGENT="newberry-site-update/1.0",
+)
 
 
-def fetch_all_items():
-    """Full-collection pull, only used with --full-scan. See fetch_discovery_items
-    and fetch_items_for_codes for the default, much faster path."""
-    print(f"Fetching EVERY searchable item from archive.org ({COLLECTION_QUERY}) -- full scan, the slow path...")
-    items = []
-    cursor = None
-    page = 0
-    total = None
-    while True:
-        page += 1
-        params = {"q": COLLECTION_QUERY, "count": "10000", "fields": FIELDS}
-        if cursor:
-            params["cursor"] = cursor
-        data = fetch_scrape_page(params)
-        # Only the FIRST page reports a trustworthy total: on cursor pages
-        # archive.org has been observed returning the whole-archive count
-        # (5,414,062) instead of this query's. Pin the first value, and never
-        # assume it is present at all -- f"{None:,}" raises TypeError.
-        if total is None:
-            total = data.get("total")
-        page_items = data.get("items", [])
-        items.extend(page_items)
-        total_str = f"{total:,}" if isinstance(total, int) else "?"
-        print(f"  page {page}: {len(items):,} / {total_str}", flush=True)
-        cursor = data.get("cursor")
-        if not cursor or not page_items:
-            break
-        time.sleep(0.2)
-    return items
+# ---------- Completed-shipment history ----------
 
-
-def fetch_discovery_items(now):
-    """
-    Phase A of the default path: one cheap query for items whose
-    republisher_date OR publicdate falls within ACTIVE_WINDOW_DAYS --
-    exactly the two signals "active" is computed from elsewhere in this
-    script. Returns the set of distinct group codes seen. See the module
-    docstring for why this can't hide a shipment that would otherwise
-    qualify.
-    """
-    cutoff = now - timedelta(days=ACTIVE_WINDOW_DAYS)
-    q = (f"{COLLECTION_QUERY} AND (republisher_date:[{cutoff.strftime('%Y%m%d%H%M%S')} TO 99991231235959] "
-         f"OR publicdate:[{cutoff.strftime('%Y-%m-%d')} TO 2099-12-31])")
-    print(f"Discovering {GROUPING_FIELD} codes with activity in the last {ACTIVE_WINDOW_DAYS} days...")
-    items = []
-    cursor = None
-    page = 0
-    while True:
-        page += 1
-        params = {"q": q, "count": "10000", "fields": f"identifier,{GROUPING_FIELD}"}
-        if cursor:
-            params["cursor"] = cursor
-        data = fetch_scrape_page(params)
-        page_items = data.get("items", [])
-        items.extend(page_items)
-        print(f"  discovery page {page}: {len(items):,} items", flush=True)
-        cursor = data.get("cursor")
-        if not cursor or not page_items:
-            break
-        time.sleep(0.2)
-    codes = {it[GROUPING_FIELD] for it in items if it.get(GROUPING_FIELD)}
-    print(f"  found {len(codes)} recently-active {GROUPING_FIELD} code(s)")
-    return codes
-
-
-def fetch_items_for_codes(codes):
-    """
-    Phase B of the default path: for each candidate code, pull its COMPLETE
-    indexed item set with its own targeted query -- not date-restricted --
-    so pattern-detection and totals are exactly as accurate as scanning the
-    whole collection would produce. Codes are fetched concurrently since
-    each query is independent and small.
-    """
-    if not codes:
-        return []
-    print(f"Fetching complete item history for {len(codes)} {GROUPING_FIELD} code(s)...")
-
-    def fetch_one(code):
-        results = []
-        cursor = None
-        while True:
-            params = {"q": f"{COLLECTION_QUERY} AND {GROUPING_FIELD}:{code}", "count": "1000", "fields": FIELDS}
-            if cursor:
-                params["cursor"] = cursor
-            data = fetch_scrape_page(params)
-            page_items = data.get("items", [])
-            results.extend(page_items)
-            cursor = data.get("cursor")
-            if not cursor or not page_items:
-                break
-        return results
-
-    all_items = []
-    done = 0
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futures = {ex.submit(fetch_one, code): code for code in sorted(codes)}
-        for fut in as_completed(futures):
-            code = futures[fut]
-            try:
-                all_items.extend(fut.result())
-            except Exception as e:
-                print(f"  WARNING: could not fetch items for {code}: {e} -- this shipment may be missing this run.")
-            done += 1
-            if done % 10 == 0 or done == len(codes):
-                print(f"  fetched {done}/{len(codes)} codes ({len(all_items):,} items so far)", flush=True)
-    return all_items
-
-
-def parse_republisher_date(value):
-    if not value:
-        return None
+def load_completed_history():
+    """{code: {"name","total","completed","discovery","pages_completed","completed_date"}}
+    for every shipment ever seen at completed==total. Kept indefinitely (it's small);
+    only the COMPLETED_DISPLAY_COUNT most recent are ever shown on the site."""
     try:
-        return datetime.strptime(value[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        return None
-
-
-def parse_publicdate(value):
-    """
-    The two archive.org APIs disagree on how they format publicdate:
-
-        search/scrape API : "2025-09-15T15:29:47Z"   (ISO-8601)
-        metadata API      : "2025-09-15 15:29:47"    (space-separated)
-
-    Handling only the second silently returned None for EVERY search result,
-    which left last_added permanently dead for indexed-only groups and made
-    recency depend entirely on republisher_date. Accept both.
-    """
-    if not isinstance(value, str) or not value:
-        return None
-    s = value.strip().replace("T", " ").rstrip("Z").strip()
-    for fmt, width in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10)):
-        try:
-            return datetime.strptime(s[:width], fmt).replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
-            continue
-    return None
-
-
-# ---------- Stub discovery (noindex items invisible to search) ----------
-
-def fetch_metadata(identifier, retries=3, timeout=15):
-    url = METADATA_URL + urllib.parse.quote(identifier)
-    for _ in range(retries):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "partner-site-update/1.0"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            return data if data else None
-        except Exception:
-            continue
-    return "FAIL"
-
-
-def detect_padding_width(numbers_and_strings):
-    smallest = min(numbers_and_strings, key=lambda t: t[0])
-    return len(smallest[1])
-
-
-def format_candidate_id(prefix, n, width):
-    if n < 10 ** width:
-        return prefix + str(n).zfill(width)
-    return prefix + str(n)
-
-
-def _is_settled(entry):
-    """
-    True for a number that will never need re-probing: a confirmed-absent
-    slot (None), or a real item that has finished digitization
-    (COMPLETE_FIELD == COMPLETE_VALUE, which doesn't regress). A found-but-
-    still-in-progress item is deliberately NOT settled -- it must keep
-    being re-probed until it actually finishes, or its progress would
-    freeze in the cache.
-    """
-    return entry is None or (isinstance(entry, dict) and entry.get(COMPLETE_FIELD) == COMPLETE_VALUE)
-
-
-def enumerate_full_shipment(prefix, known_numbers, cached_resolved=None, batch_size=15, max_extra_batches=8):
-    """
-    known_numbers: {number: {"identifier", COMPLETE_FIELD, "publicdate"}}
-        from THIS run's fresh search index.
-    cached_resolved: {number: entry_or_None} of numbers already conclusively
-        settled as of a PRIOR run (see _is_settled) -- skipped on reprobe.
-
-    Returns (found, settled, cache_hits, unresolved):
-        found      -- {number: entry} for every real item now known.
-        settled    -- {number: entry_or_None}, the subset worth caching for
-                       next run (see _is_settled).
-        cache_hits -- how many numbers were resolved from the cache instead
-                       of a network probe, for the summary print.
-        unresolved -- probes that FAILED (network/throttling) -- not the
-                      same as a number being confirmed absent.
-
-    Walking past the highest known number to look for brand-new hidden
-    items always runs here, regardless of the cache -- that check is the
-    one thing this whole pipeline exists to guarantee.
-    """
-    cached_resolved = cached_resolved or {}
-    numbers = sorted(known_numbers.keys())
-    width = detect_padding_width([(n, known_numbers[n]["identifier"][len(prefix):]) for n in numbers])
-    hi = numbers[-1]
-
-    found = dict(known_numbers)
-    settled = {n: e for n, e in cached_resolved.items() if _is_settled(e) and n <= hi}
-    for n, e in settled.items():
-        if isinstance(e, dict) and n not in found:
-            found[n] = e
-
-    to_probe = [n for n in range(1, hi + 1) if n not in found and n not in settled]
-    # Numbers resolved from the cache instead of a fresh probe, for the summary print.
-    cache_hits = sum(1 for n in range(1, hi + 1) if n not in known_numbers and n in settled)
-
-    unresolved = 0
-
-    def probe(n):
-        """
-        Returns (n, data_or_None, ok). ok=False means the fetch FAILED, which
-        is NOT the same as the item not existing -- a missing identifier
-        returns HTTP 200 with an empty body (-> None, ok=True); only a
-        network error or throttled request yields "FAIL". Collapsing those
-        two silently shrinks the total.
-        """
-        ident = format_candidate_id(prefix, n, width)
-        data = fetch_metadata(ident)
-        if data == "FAIL":
-            return (n, None, False)
-        if data is None:
-            return (n, None, True)
-        md = data.get("metadata", {})
-        return (n, {"identifier": ident, COMPLETE_FIELD: md.get(COMPLETE_FIELD), "publicdate": md.get("publicdate")}, True)
-
-    if to_probe:
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            futures = [ex.submit(probe, n) for n in to_probe]
-            for fut in as_completed(futures):
-                n, data, ok = fut.result()
-                if not ok:
-                    unresolved += 1
-                    continue
-                if data:
-                    found[n] = data
-                    if _is_settled(data):
-                        settled[n] = data
-                else:
-                    settled[n] = None  # confirmed absent -- safe to cache
-
-    # Extend past the highest known number in parallel batches, stop once a
-    # whole batch misses. This is NEVER skipped by the cache -- it's how a
-    # genuinely new hidden item beyond the known ceiling gets caught.
-    n = hi + 1
-    for _ in range(max_extra_batches):
-        batch = list(range(n, n + batch_size))
-        hits = 0
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            futures = [ex.submit(probe, b) for b in batch]
-            for fut in as_completed(futures):
-                bn, data, ok = fut.result()
-                if not ok:
-                    unresolved += 1
-                    continue
-                if data:
-                    found[bn] = data
-                    hits += 1
-                    if _is_settled(data):
-                        settled[bn] = data
-                else:
-                    settled[bn] = None
-        n += batch_size
-        if hits == 0:
-            break
-
-    return found, settled, cache_hits, unresolved
-
-
-def find_enumerable_candidates(indexed_by_code):
-    """Detect group codes whose identifiers show a clean prefix+number pattern."""
-    candidates = {}
-    for code, entries in indexed_by_code.items():
-        matches = [(e, ID_PATTERN.match(e["identifier"])) for e in entries]
-        good = [(e, m) for e, m in matches if m]
-        if len(good) < 1 or len(good) < 0.9 * len(entries):
-            continue
-        prefixes = set(m.group(1).lower() for _, m in good)
-        if len(prefixes) != 1:
-            continue
-        prefix = next(iter(prefixes))
-        numbers = {}
-        for e, m in good:
-            numbers[int(m.group(2))] = {"identifier": e["identifier"], COMPLETE_FIELD: e.get(COMPLETE_FIELD), "publicdate": e.get("publicdate")}
-        lo, hi = min(numbers), max(numbers)
-        span = hi - lo + 1
-        ratio = span / len(numbers)
-        # lo<=5 and ratio<=8 are the two safety filters that separate real
-        # sequential batches from coincidental digit suffixes (e.g. a
-        # periodical volume identifier ending in a year). Validate these
-        # against your own collection's data before trusting them blindly —
-        # see "Step 3" in SKILL.md.
-        if lo <= 5 and ratio <= 8:
-            candidates[code] = (prefix, numbers)
-    return candidates
-
-
-def _load_json_map(path, value_type, label):
-    """
-    Load a {key: value} JSON map, skipping "_"-prefixed keys.
-
-    The shipped example files carry their documentation in "_comment"/
-    "_example" keys. Without this skip, copying an example file as-is (which
-    is exactly what SKILL.md Step 4 tells you to do) crashes on the first run
-    with "TypeError: string indices must be integers", and "_example" would
-    otherwise be enumerated as if it were a real shipment.
-    """
-    try:
-        with open(path, encoding="utf-8") as f:
+        with open(COMPLETED_HISTORY_PATH, encoding="utf-8") as f:
             raw = json.load(f)
     except FileNotFoundError:
         return {}
     except json.JSONDecodeError as e:
-        print(f"  WARNING: {path} is not valid JSON ({e}) -- ignoring it.")
-        return {}
-    if not isinstance(raw, dict):
-        print(f"  WARNING: {path} should contain a JSON object -- ignoring it.")
-        return {}
-    out = {}
-    for k, v in raw.items():
-        if k.startswith("_"):
-            continue
-        if not isinstance(v, value_type):
-            print(f"  WARNING: ignoring {label} entry '{k}' -- unexpected format.")
-            continue
-        out[k] = v
-    return out
-
-
-def load_seeds():
-    return _load_json_map(SEEDS_PATH, dict, "seed")
-
-
-def load_names():
-    """Optional {CODE: "Friendly name"} map -- see shipment_names.example.json."""
-    return _load_json_map(NAMES_PATH, str, "name")
-
-
-def load_enum_cache():
-    """{code: {"n": entry_or_None, ...}} of conclusively settled numbers as of the last successful run."""
-    try:
-        with open(ENUM_CACHE_PATH, encoding="utf-8") as f:
-            raw = json.load(f)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError as e:
-        print(f"  WARNING: {ENUM_CACHE_PATH} is not valid JSON ({e}) -- starting with an empty cache.")
+        print(f"  WARNING: {COMPLETED_HISTORY_PATH} is not valid JSON ({e}) -- starting with an empty history.")
         return {}
     return raw if isinstance(raw, dict) else {}
 
 
-def save_enum_cache(cache):
-    with open(ENUM_CACHE_PATH, "w", encoding="utf-8") as f:
-        json.dump(cache, f, separators=(",", ":"))
+def save_completed_history(history):
+    with open(COMPLETED_HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump(history, f, separators=(",", ":"))
 
 
 # ---------- Aggregation ----------
 
-def build_shipments_data(items, seeds=None):
-    if seeds is None:
-        seeds = load_seeds()
+def build_shipments_data(items, manifest, prev_shipments=None):
+    prev_by_code = {s["code"]: s for s in (prev_shipments or [])}
 
-    indexed_by_code = defaultdict(list)
-    for it in items:
-        code = it.get(GROUPING_FIELD)
-        if code:
-            indexed_by_code[code].append(it)
-
-    candidates = find_enumerable_candidates(indexed_by_code)
-
-    for code, seed in seeds.items():
-        if code not in candidates:
-            prefix = seed["prefix"]
-            seed_id = seed["seed_identifier"]
-            data = fetch_metadata(seed_id)
-            numbers = {}
-            if data and data != "FAIL":
-                md = data.get("metadata", {})
-                numbers[seed["seed_number"]] = {"identifier": seed_id, COMPLETE_FIELD: md.get(COMPLETE_FIELD), "publicdate": md.get("publicdate")}
-            else:
-                print(f"  WARNING: seed identifier '{seed_id}' for {code} could not be fetched — skipping stub discovery for this shipment.")
-            if numbers:
-                candidates[code] = (prefix, numbers)
-
-    print(f"Detected {len(candidates)} group codes eligible for stub discovery (incl. {len(seeds)} seeded).")
-
-    names = load_names()
-    if names:
-        print(f"Loaded {len(names)} friendly shipment name(s) from {NAMES_PATH}.")
-
-    enum_cache = load_enum_cache()
-    new_enum_cache = {}
-
-    groups = {}
-    total_unresolved = 0
-    total_cache_hits = 0
-
-    # Codes with a detectable/seedable pattern: enumerate the true full set.
-    for code, (prefix, numbers) in candidates.items():
-        cached = {int(k): v for k, v in enum_cache.get(code, {}).items()}
-        cache_note = f" ({len(cached)} settled in cache)" if cached else ""
-        print(f"  enumerating {code} (prefix={prefix}){cache_note}...", flush=True)
-        full, settled, cache_hits, unresolved = enumerate_full_shipment(prefix, numbers, cached_resolved=cached)
-        new_enum_cache[code] = {str(n): e for n, e in settled.items()}
-        total_cache_hits += cache_hits
-        total_unresolved += unresolved
-        if unresolved:
-            print(f"    WARNING: {unresolved} identifier probe(s) for {code} could not be "
-                  f"resolved (network error or throttling) -- this row may undercount.", flush=True)
-        total = len(full)
-        completed = sum(1 for v in full.values() if v.get(COMPLETE_FIELD) == COMPLETE_VALUE)
-        last_republish = None
-        last_added = None
-        for v in full.values():
-            pd = parse_publicdate(v.get("publicdate"))
-            if pd and (last_added is None or pd > last_added):
-                last_added = pd
-        # republisher_date is only present in the bulk index fields, not the per-item probe results
-        for it in indexed_by_code.get(code, []):
-            rd = parse_republisher_date(it.get("republisher_date"))
-            if rd and (last_republish is None or rd > last_republish):
-                last_republish = rd
-        groups[code] = {
-            "total": total,
-            "completed": completed,
-            "last_republish": last_republish,
-            "last_added": last_added,
-            "discovery": "enumerated",
-            "unresolved": unresolved,
-        }
-
-    if total_cache_hits:
-        print(f"  (cache avoided re-probing {total_cache_hits} already-settled number(s) this run)")
-
-    # Everything else: indexed-only counts (search-based, may undercount hidden stubs).
-    for code, entries in indexed_by_code.items():
-        if code in groups:
-            continue
-        total = len(entries)
-        completed = sum(1 for e in entries if e.get(COMPLETE_FIELD) == COMPLETE_VALUE)
-        last_republish = None
-        last_added = None
-        for e in entries:
-            rd = parse_republisher_date(e.get("republisher_date"))
-            if rd and (last_republish is None or rd > last_republish):
-                last_republish = rd
-            pd = parse_publicdate(e.get("publicdate"))
-            if pd and (last_added is None or pd > last_added):
-                last_added = pd
-        groups[code] = {
-            "total": total,
-            "completed": completed,
-            "last_republish": last_republish,
-            "last_added": last_added,
-            "discovery": "indexed-only",
-            "unresolved": 0,
-        }
+    built = core.build_groups(items, manifest)
+    groups = built["groups"]
+    new_enum_cache = built["enum_cache"]
+    manifest_warnings = built["warnings"]
+    total_unresolved = built["unresolved"]
+    hard_block = built["hard_block"]
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=ACTIVE_WINDOW_DAYS)
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_DECLARED_DAYS)
+    quiet_cutoff = datetime.now(timezone.utc) - timedelta(days=UNCONFIRMED_QUIET_DAYS)
+
+    # A shipment appearing here has had activity in the last ACTIVE_WINDOW_DAYS.
+    # This used to be the entire "active" list, which meant a shipment that
+    # finished long ago could still clutter the dashboard for up to 90 days
+    # after completing, while one that finished 91+ days ago just vanished with
+    # no record. Instead: genuinely in-progress shipments (completed < total)
+    # are shown here as before ("active", unchanged); a shipment that is fully
+    # done is recorded once into COMPLETED_HISTORY_PATH (permanent, keyed by
+    # code, never re-added) and only the COMPLETED_DISPLAY_COUNT most recent
+    # such completions are ever shown, regardless of the activity window.
+    completed_history = load_completed_history()
+
+    # A name recorded into history at completion time is never touched again by
+    # the code below (it only ever writes a NEW entry once) -- so a name added
+    # or corrected in the manifest after a shipment already completed would
+    # otherwise never reach the display. Refresh every existing entry's name
+    # from the current manifest on every run; harmless no-op when nothing changed.
+    for code, h in completed_history.items():
+        h["name"] = (manifest.get(code) or {}).get("name") or h.get("name")
+
+    # One-time migration shim (a no-op on every later run): a shipment that was
+    # already completed==total in the PREVIOUS snapshot but has since aged out
+    # of this run's activity window entirely won't appear in `groups` at all --
+    # without this, it would be silently lost from completed_history forever
+    # the moment this feature was turned on, rather than just missing the "last
+    # N" display cutoff like an intentionally-aged shipment. Only applies to
+    # codes not already tracked; every code is tracked permanently once seen.
+    for code, prev in prev_by_code.items():
+        if code in completed_history:
+            continue
+        if prev.get("total") and prev["completed"] >= prev["total"] and prev.get("total_confirmed") is not False:
+            completed_history[code] = {
+                "name": prev.get("name"),
+                "total": prev["total"],
+                "completed": prev["completed"],
+                "discovery": prev.get("discovery"),
+                "pages_completed": prev.get("pages_completed"),
+                "completed_date": prev.get("last_activity") or date.today().strftime("%Y-%m-%d"),
+            }
 
     active = []
+    just_finalized_codes = []
     for code, g in groups.items():
-        recent = (g["last_republish"] and g["last_republish"] >= cutoff) or (g["last_added"] and g["last_added"] >= cutoff)
-        if recent:
-            last_dates = [d for d in (g["last_republish"], g["last_added"]) if d]
-            active.append({
-                "code": code,
-                "name": names.get(code),
+        m = manifest.get(code, {})
+        last_dates = [d for d in (g["last_republish"], g["last_added"]) if d]
+        recent = bool(last_dates) and max(last_dates) >= cutoff
+
+        # A manifest-declared shipment that has never had ANY activity at all
+        # (no items yet, so no dates to be recent about) still needs to show
+        # up -- this is the exact case that was invisible before the manifest
+        # existed. It stays visible unconditionally while un-closed; a
+        # STALE_DECLARED_DAYS-old one gets a warning, not a removal.
+        is_declared_no_activity = bool(m.get("identifier_prefix")) and not m.get("closed") and not last_dates
+        # Likewise, a shipment with a packing-list count it hasn't reached yet is
+        # still in progress no matter how long the scanners have paused on it.
+        is_declared_unfinished = bool(m.get("expected_items")) and not m.get("closed") and g["completed"] < g["total"]
+
+        if not (recent or is_declared_no_activity or is_declared_unfinished):
+            continue
+
+        if is_declared_no_activity:
+            received_dt = None
+            if m.get("received"):
+                try:
+                    received_dt = datetime.strptime(m["received"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pass
+            if received_dt is None:
+                manifest_warnings.append({
+                    "code": code, "kind": "no_received_date",
+                    "detail": "has identifier_prefix but no 'received' date -- add one so staleness can be tracked.",
+                })
+            elif received_dt < stale_cutoff:
+                manifest_warnings.append({
+                    "code": code, "kind": "no_items_yet",
+                    "detail": f"received {m['received']} but still has no items after "
+                              f"{STALE_DECLARED_DAYS} days -- identifier_prefix is probably wrong.",
+                })
+
+        last_activity = max(last_dates).strftime("%Y-%m-%d") if last_dates else None
+        # Search only ever shows finished items, so a shipment with no packing-
+        # list count and no number pattern always reads 100% -- even mid-scan.
+        # Don't call it complete until new items have stopped arriving.
+        quiet = not last_dates or max(last_dates) < quiet_cutoff
+        is_complete = g["total"] > 0 and g["completed"] >= g["total"] and (g["total_confirmed"] or quiet)
+
+        row = {
+            "code": code,
+            "name": m.get("name"),
+            "total": g["total"],
+            "completed": g["completed"],
+            "completed_unindexed": g["completed_unindexed"],
+            "pages_completed": g["pages_completed"],
+            "pages_scanned": g["pages_scanned"],
+            "discovery": g["discovery"],
+            "total_source": g["total_source"],
+            "total_confirmed": g["total_confirmed"],
+            "expected_items": g["expected_items"],
+            "observed_items": g["observed_items"],
+            "overage": g["overage"],
+            "unresolved": g["unresolved"],
+            "last_activity": last_activity,
+            "received": m.get("received"),
+        }
+
+        if not is_complete:
+            # A shipment recorded as complete earlier can turn out to be bigger
+            # than it looked (more items scanned since, or an expected_items
+            # added to the manifest). Take it back out of history -- otherwise it
+            # would show in both lists, and the stale "done" row would win once
+            # it ages out of Active.
+            if completed_history.pop(code, None) is not None:
+                print(f"  {code}: was recorded complete but is now {g['completed']}/{g['total']} -- reopened.")
+            active.append(row)
+            continue
+
+        if code in completed_history:
+            # Already recorded as complete in a prior run. Refresh its numbers
+            # every run it's still active: a shipment whose items each finish
+            # before search sees the next one (common for title-named batches
+            # with no number pattern) reads 100% at every step, so the first
+            # snapshot -- often 1/1 -- would otherwise be frozen in forever.
+            h = completed_history[code]
+            if (h.get("total"), h.get("completed")) != (g["total"], g["completed"]):
+                print(f"  {code}: completed record updated {h.get('completed')}/{h.get('total')} "
+                      f"-> {g['completed']}/{g['total']}")
+            h.update({
                 "total": g["total"],
                 "completed": g["completed"],
+                "total_confirmed": g["total_confirmed"],
                 "discovery": g["discovery"],
-                "unresolved": g["unresolved"],
-                "last_activity": max(last_dates).strftime("%Y-%m-%d") if last_dates else None,
+                "pages_completed": g["pages_completed"],
+                "completed_date": max(h.get("completed_date") or "", last_activity or ""),
             })
+            continue
+
+        # First time this code is seen at completed==total: record it permanently.
+        completed_history[code] = {
+            "name": m.get("name"),
+            "total": g["total"],
+            "completed": g["completed"],
+            "total_confirmed": g["total_confirmed"],
+            "discovery": g["discovery"],
+            "pages_completed": g["pages_completed"],
+            "completed_date": last_activity or date.today().strftime("%Y-%m-%d"),
+        }
+
+        prev = prev_by_code.get(code)
+        was_in_progress_before = prev is not None and prev.get("total") and (
+            prev["completed"] < prev["total"] or prev.get("total_confirmed") is False)
+        if was_in_progress_before:
+            # This run is the one where the final item finished -- show it one
+            # last time in Active, flagged, before it settles into history-only.
+            just_finalized_codes.append(code)
+            active.append({**row, "finalizing": True})
+        # else: a code we've never tracked before, already complete the first
+        # time we see it -- backfilled into history above with no finalizing
+        # badge, since we can't claim it "just" finished.
 
     active.sort(key=lambda s: (s["completed"] / s["total"] if s["total"] else 0))
 
-    total_items = sum(s["total"] for s in active)
-    total_completed = sum(s["completed"] for s in active)
+    completed_display = sorted(
+        completed_history.items(), key=lambda kv: kv[1].get("completed_date") or "", reverse=True
+    )[:COMPLETED_DISPLAY_COUNT]
+    completed_shipments = [
+        {
+            "code": code,
+            "name": h.get("name"),
+            "total": h["total"],
+            "completed": h["completed"],
+            "total_confirmed": h.get("total_confirmed", h.get("discovery") != "indexed-only"),
+            "discovery": h.get("discovery"),
+            "pages_completed": h.get("pages_completed"),
+            "completed_date": h.get("completed_date"),
+        }
+        for code, h in completed_display
+    ]
+
+    # Totals cover what's actually rendered (active + the visible completed
+    # rows) so the KPI row measures the same universe a viewer sees, not the
+    # entire unbounded completed_history.
+    total_items = sum(s["total"] for s in active) + sum(s["total"] for s in completed_shipments)
+    total_completed = sum(s["completed"] for s in active) + sum(s["completed"] for s in completed_shipments)
+    total_pages_completed = (
+        sum(s.get("pages_completed") or 0 for s in active)
+        + sum(s.get("pages_completed") or 0 for s in completed_shipments)
+    )
+    # Sum of what was actually OBSERVED this run, across every code processed --
+    # independent of any manifest inflation. This is what the outage/emptiness
+    # guard in sanity_check() keys off, so a manifest can never blind it.
+    total_observed_items = sum(g["observed_items"] for g in groups.values())
+    total_probes = sum(g.get("total_probes", 0) for g in groups.values())
+
+    if just_finalized_codes:
+        print(f"  {len(just_finalized_codes)} shipment(s) just reached 100% complete: {', '.join(just_finalized_codes)}")
+    if manifest_warnings:
+        print(f"  {len(manifest_warnings)} manifest warning(s):")
+        for w in manifest_warnings:
+            print(f"    {w['code']}: {w['detail']}")
 
     return {
-        "generated_note": f"Snapshot of archive.org metadata for {COLLECTION_QUERY}, grouped by {GROUPING_FIELD}, including stub items recovered via direct identifier discovery where possible",
+        "generated_note": f"Snapshot of archive.org metadata for {COLLECTION_QUERY}, grouped by {GROUPING_FIELD}, including stub items recovered via direct identifier discovery or manifest declaration where possible",
         "active_window_days": ACTIVE_WINDOW_DAYS,
         "shipment_count": len(active),
         "total_items": total_items,
         "total_completed": total_completed,
+        "total_pages_completed": total_pages_completed,
+        "total_observed_items": total_observed_items,
+        "total_probes": total_probes,
         "unresolved_probes": total_unresolved,
+        "manifest_warnings": manifest_warnings,
         "shipments": active,
-    }, new_enum_cache
+        "completed_shipments": completed_shipments,
+    }, new_enum_cache, completed_history, hard_block
 
-
-def inject(html, data, snapshot_date):
-    data_json = json.dumps(data, separators=(",", ":"))
-
-    html, n1 = re.subn(
-        r"^const SHIPMENTS = .*;$",
-        "const SHIPMENTS = " + data_json.replace("\\", "\\\\") + ";",
-        html, count=1, flags=re.M,
-    )
-    html, n2 = re.subn(
-        r'^const SNAPSHOT_DATE = ".*";$',
-        f'const SNAPSHOT_DATE = "{snapshot_date}";',
-        html, count=1, flags=re.M,
-    )
-
-    if not (n1 and n2):
-        raise RuntimeError(
-            f"Could not find expected markers in {SITE_PATH} "
-            f"(SHIPMENTS matched {n1}, SNAPSHOT_DATE matched {n2}). "
-            "The file may have been edited in a way that moved/renamed these lines."
-        )
-    return html
-
-
-def previous_data(html):
-    """The data currently in the file we are about to overwrite."""
-    m = re.search(r"^const SHIPMENTS = (.*);$", html, re.M)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return None
-
-
-def sanity_check(html, data, force=False):
+def sanity_check(html, data, force=False, quiet_period=False):
     """
-    Refuse to overwrite a working dashboard with implausible data.
+    Refuse to overwrite a working page with implausible data.
 
-    The required_keys check only ever verified that keys EXIST. An archive.org
-    outage, a throttled run, or a typo'd collection query all produce a
-    perfectly well-formed result with every key present and zeroes in it --
-    which the scheduled Action would then commit and push to the partner's
-    live URL with nobody in the loop.
+    An archive.org outage, a throttled run, or a typo'd collection query all
+    produce a perfectly well-formed result with every key present and zeroes
+    in it -- which the scheduled Action would then commit and push to the
+    partner's live URL with nobody in the loop. This keys off
+    total_observed_items rather than the manifest-inflated total_items so a
+    declared shipment can never blind the guard.
+
+    quiet_period means the run confirmed the collection still has items but
+    nothing was recently active -- the normal state once every shipment has
+    finished. That is not an outage, so an empty active list and a drop in
+    observed items are allowed then; the displayed-total check still applies.
     """
     problems = []
 
-    if not data["shipment_count"] or not data["total_items"]:
+    if not data.get("total_observed_items") and not quiet_period:
         problems.append(
-            f"result is empty (shipments={data['shipment_count']}, items={data['total_items']}) "
-            "-- archive.org may be unreachable, or the collection query may be wrong"
+            f"nothing was observed at all (observed items={data.get('total_observed_items')}) -- "
+            "archive.org may be unreachable, or the collection query may be wrong"
         )
 
-    if data.get("unresolved_probes", 0) > MAX_UNRESOLVED_PROBES:
+    unresolved_limit = max(MAX_UNRESOLVED_PROBES, int(MAX_UNRESOLVED_PROBE_RATE * data.get("total_probes", 0)))
+    if data.get("unresolved_probes", 0) > unresolved_limit:
         problems.append(
             f"{data['unresolved_probes']} identifier probes could not be resolved "
-            f"(limit {MAX_UNRESOLVED_PROBES}) -- totals would undercount"
+            f"(limit {unresolved_limit} of {data.get('total_probes', 0)} probes this run) -- "
+            "totals would undercount"
         )
 
-    prev = previous_data(html)
-    if prev and prev.get("total_items"):
-        drop = 100.0 * (prev["total_items"] - data["total_items"]) / prev["total_items"]
-        if drop > MAX_SHRINK_PCT:
-            problems.append(
-                f"total items fell {drop:.0f}% ({prev['total_items']:,} -> {data['total_items']:,}), "
-                f"more than the {MAX_SHRINK_PCT}% limit"
-            )
+    prev = core.previous_const(html, "SHIPMENTS")
+    if prev:
+        prev_observed = prev.get("total_observed_items", prev.get("total_items"))
+        if prev_observed and not quiet_period:
+            drop = 100.0 * (prev_observed - data["total_observed_items"]) / prev_observed
+            if drop > MAX_SHRINK_PCT:
+                problems.append(
+                    f"observed items fell {drop:.0f}% ({prev_observed:,} -> {data['total_observed_items']:,}), "
+                    f"more than the {MAX_SHRINK_PCT}% limit"
+                )
+        if prev.get("total_items"):
+            total_drop = 100.0 * (prev["total_items"] - data["total_items"]) / prev["total_items"]
+            if total_drop > MAX_DISPLAYED_SHRINK_PCT:
+                problems.append(
+                    f"displayed total items fell {total_drop:.0f}% ({prev['total_items']:,} -> "
+                    f"{data['total_items']:,}) -- check for a manifest typo (expected_items set too "
+                    "low, or a shipment marked closed by mistake)"
+                )
 
     if not problems:
         return True
@@ -677,6 +409,7 @@ def sanity_check(html, data, force=False):
 
 
 def main():
+    core.require_filled_in(globals())
     try:
         with open(SITE_PATH, encoding="utf-8") as f:
             html = f.read()
@@ -685,53 +418,79 @@ def main():
         sys.exit(1)
 
     now = datetime.now(timezone.utc)
-    seeds = load_seeds()
+    manifest = load_manifest()
+    declared_codes = {code for code, m in manifest.items() if m.get("identifier_prefix")}
+    # Codes with a packing-list count are fetched too, so one that has paused
+    # past the activity window still gets its items counted.
+    counted_codes = {code for code, m in manifest.items() if m.get("expected_items") and not m.get("closed")}
 
-    if "--full-scan" in sys.argv:
-        print("--full-scan given: pulling the ENTIRE collection (the slow, exhaustive audit path).")
-        items = fetch_all_items()
-    else:
-        discovered_codes = fetch_discovery_items(now)
-        target_codes = discovered_codes | set(seeds.keys())
-        items = fetch_items_for_codes(target_codes)
+    full_scan = "--full-scan" in sys.argv
+    if full_scan or "--recheck-absent" in sys.argv:
+        core.configure(FORCE_RECHECK_ABSENT=True)
 
-    if not items and not seeds:
-        print("archive.org returned no items at all -- refusing to write. Nothing was changed.")
+    items, failed = core.load_items(now, extra_codes=declared_codes | counted_codes, full_scan=full_scan)
+    if failed:
+        print()
+        print(f"REFUSING TO WRITE -- could not fetch the items for: {', '.join(failed)}.")
+        print("Publishing without them would show a wrong number. Nothing was changed; try again shortly.")
+        sys.exit(1)
+    if not core.check_not_empty(items, bool(declared_codes)):
+        sys.exit(1)
+    quiet_period = not items
+
+    prev = core.previous_const(html, "SHIPMENTS")
+    data, new_enum_cache, new_completed_history, hard_block = build_shipments_data(
+        items, manifest, prev_shipments=(prev or {}).get("shipments", [])
+    )
+
+    if hard_block:
+        print()
+        print("REFUSING TO WRITE -- a manifest-declared identifier_prefix is wrong (it collided with a "
+              "DIFFERENT shipment's real items, or differs from the real identifiers only in "
+              f"capitalization). This cannot be overridden with --force; fix the prefix in {MANIFEST_PATH} "
+              "first. See the manifest warning(s) above.")
         sys.exit(1)
 
-    data, new_enum_cache = build_shipments_data(items, seeds=seeds)
     snapshot_date = date.today().strftime("%B %-d, %Y")
 
-    required_keys = {"active_window_days", "shipment_count", "total_items", "total_completed", "shipments"}
+    required_keys = {"active_window_days", "shipment_count", "total_items", "total_completed", "shipments", "completed_shipments"}
     missing = required_keys - data.keys()
     if missing:
         print(f"Refusing to write site: built data is missing expected keys: {sorted(missing)}")
         sys.exit(1)
 
-    if not sanity_check(html, data, force="--force" in sys.argv):
+    if not sanity_check(html, data, force="--force" in sys.argv, quiet_period=quiet_period):
         sys.exit(1)
 
-    new_html = inject(html, data, snapshot_date)
+    new_html = core.inject_const(html, "SHIPMENTS", data, snapshot_date, SITE_PATH)
 
     with open(SITE_PATH, "w", encoding="utf-8") as f:
         f.write(new_html)
 
     # Deferred until AFTER a successful write, so a refused/failed run never
-    # pollutes the enumeration cache with data from a snapshot nobody
-    # actually published.
-    save_enum_cache(new_enum_cache)
+    # pollutes the enumeration cache (or the completed-shipment history) with
+    # data from a snapshot nobody actually published.
+    core.save_enum_cache(new_enum_cache)
+    save_completed_history(new_completed_history)
 
     print()
-    print("Done. Dashboard updated:")
+    print("Done. Page updated:")
     print(f"  Active shipments (last {ACTIVE_WINDOW_DAYS} days): {data['shipment_count']}")
     print(f"  Items completed / total: {data['total_completed']:,} / {data['total_items']:,}")
     print(f"  Snapshot date: {snapshot_date}")
     for s in data["shipments"]:
-        flag = "" if s["discovery"] == "enumerated" else "  (indexed-only, may undercount stubs)"
+        flag = "" if s["total_confirmed"] else "  (total not confirmed -- may undercount)"
         if s.get("unresolved"):
             flag += f"  ({s['unresolved']} probe(s) unresolved)"
+        if s.get("finalizing"):
+            flag += "  [FINALIZING -- just reached 100%]"
         label = f"{s['code']} - {s['name']}" if s.get("name") else s["code"]
         print(f"    {label:44s} {s['completed']:4d} / {s['total']:4d}{flag}")
+    if data["completed_shipments"]:
+        print(f"  Recently completed (showing {len(data['completed_shipments'])} of {len(new_completed_history)} tracked):")
+        for s in data["completed_shipments"]:
+            label = f"{s['code']} - {s['name']}" if s.get("name") else s["code"]
+            print(f"    {label:44s} {s['completed']:4d} / {s['total']:4d}  (completed {s['completed_date']})")
     print()
 
 
